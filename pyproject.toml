@@ -1,7 +1,7 @@
 [project]
-name = "llm-digester"
+name = "whatsapp-llm-digester"
 version = "0.1.0"
-description = "Local, reusable media and document to Markdown pipeline"
+description = "Local, privacy-first WhatsApp media and document to Markdown digestion pipeline"
 requires-python = ">=3.12,<3.14"
 dependencies = [
   "markitdown[docx,outlook,pdf,pptx,xls,xlsx]>=0.1.4",

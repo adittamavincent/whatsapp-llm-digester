@@ -1,12 +1,29 @@
-# macOS
+# macOS & OS artifacts
 .DS_Store
+*.swp
+*~
 
 # Python and local environment
 .venv/
 __pycache__/
 *.py[cod]
+*.egg-info/
+dist/
+build/
 
-# Local configuration
+# Local configuration & secrets
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+
+# Data directories & WhatsApp export content
+target/
+../target/
+*.opus
+*.vcf
+
+# Caches and logs
+.cache/
+*.log

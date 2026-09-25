@@ -386,7 +386,7 @@ class Converter:
         except (ValueError, subprocess.SubprocessError):
             return []
         timestamps = sorted({round(duration * ratio, 3) for ratio in (0.2, 0.5, 0.8) if duration > 0})
-        frame_dir = Path(tempfile.mkdtemp(prefix="llm-digester-frames-"))
+        frame_dir = Path(tempfile.mkdtemp(prefix="whatsapp-llm-digester-frames-"))
         frames: list[tuple[float, Path]] = []
         for index, timestamp in enumerate(timestamps, start=1):
             frame = frame_dir / f"frame-{index}.jpg"

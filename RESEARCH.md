@@ -35,6 +35,11 @@ Docling now has broad local support for PDFs, Office files, images, audio, and v
 - [Docling README](https://github.com/docling-project/docling)
 - [Forum comparison of PDF/DOCX-to-Markdown tools](https://www.reddit.com/r/Rag/comments/1sl515w/tools_for_working_with_docdocx_and_pdf_files/)
 
-## Privacy boundary
+## Privacy & security boundaries
 
-The base pipeline calls only local executables and Python libraries. The first setup/model run needs internet access to download packages and model weights. After those downloads, conversion is local. Optional vision uses the Ollama endpoint on `127.0.0.1`.
+The pipeline is designed specifically for sensitive personal or corporate chat histories:
+- **Zero cloud API usage**: The core pipeline relies exclusively on local binaries (`ffmpeg`, `ffprobe`, `tesseract`) and local Python packages. Files are never uploaded or streamed to any remote SaaS service.
+- **Offline operation**: The only network usage occurs during initial installation (`uv sync`, downloading Whisper weights from Hugging Face). Once cached in `.cache/`, the pipeline can run completely offline.
+- **Loopback-only vision model**: When `--vision-model` is enabled, HTTP calls are restricted to the local loopback address (`http://127.0.0.1:11434`), eliminating third-party model leaks.
+- **Immutability of originals**: Source inputs in `todo/` are accessed in read-only mode to prevent accidental corruption or data loss.
+- **Strict storage boundary**: Output and cache paths are segregated into `target/` outside the code repository, guarding against inadvertent commits of private data to version control.

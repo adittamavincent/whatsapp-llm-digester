@@ -1,11 +1,11 @@
-# Local LLM digester
+# whatsapp-llm-digester
 
 This project converts files from `../target/todo` into provenance-rich Markdown without uploading the source files. It writes one file per source under `../target/markdown` and rebuilds `../target/combined.md` for direct use with an LLM.
 
 ## Quick start
 
 ```bash
-cd llm-digester
+cd whatsapp-llm-digester
 ./setup.sh
 ./run.sh
 ```
@@ -69,16 +69,38 @@ brew install tesseract-lang
 
 ```text
 this folder/
-├── llm-digester/       reusable code and Python environment
+├── whatsapp-llm-digester/ reusable code and Python environment
 └── target/
-    ├── todo/           source files; never modified by the pipeline
-    ├── markdown/       one Markdown file per source
-    ├── combined.md     all successful records in filename order
-    ├── .manifest.json  incremental-processing state
-    └── .cache/         package and local Whisper-model downloads
+    ├── todo/              source files; never modified by the pipeline
+    ├── markdown/          one Markdown file per source
+    ├── combined.md        all successful records in filename order
+    ├── .manifest.json     incremental-processing state
+    └── .cache/            package and local Whisper-model downloads
 ```
 
 The code resolves `../target` from its own location, not from the terminal's current directory. You can call `run.sh` from anywhere.
+
+## Privacy & Security Architecture
+
+This pipeline is built for zero external data exposure and local-first execution:
+
+1. **Air-gapped by design during processing**:
+   - **No cloud APIs**: Media, documents, audio, and images are never uploaded or streamed to external servers or remote LLMs.
+   - **Local models only**: Speech transcription runs locally via Metal/MLX (`mlx-whisper`) or CPU/GPU (`faster-whisper`).
+   - **Local vision option**: If `--vision-model` is specified, image analysis connects strictly to your local Ollama instance on `127.0.0.1:11434`.
+2. **Network access boundaries**:
+   - Internet connection is used **only** during initial installation and downloading model weights (e.g. Hugging Face weights for Whisper or `brew install`).
+   - No analytics, telemetry, or phone-home requests are included.
+3. **Data safety and provenance**:
+   - Original source files in `todo/` are mounted read-only by the pipeline; they are never moved, modified, or deleted.
+   - All generated Markdown files embed SHA-256 integrity checksums, timestamps, and model parameters in standard YAML front matter.
+   - Intermediate temporary artifacts (like extracted video frames) are created in restricted temporary directories and automatically cleaned up upon completion.
+4. **Target directory isolation**:
+   - Processed data, transcripts, cache, and manifests reside outside the source code repository under `target/` to eliminate accidental git commits of sensitive chat records.
+
+> [!CAUTION]
+> **Handling Personal Identifiable Information (PII)**:
+> WhatsApp exports typically contain phone numbers, private chat transcripts, personal names, locations, and media. The generated `combined.md` and Markdown files contain plaintext representations of this data. Ensure you do not commit `target/`, upload `combined.md` to public repositories, or send sensitive excerpts to public cloud services without proper consent or redaction.
 
 ## Limits
 
