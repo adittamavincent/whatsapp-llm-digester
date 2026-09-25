@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Python and local environment
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local configuration
+.env
+.env.*
+!.env.example
