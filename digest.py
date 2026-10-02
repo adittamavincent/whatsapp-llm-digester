@@ -8,6 +8,7 @@ import base64
 import datetime as dt
 import hashlib
 import json
+import logging
 import mimetypes
 import os
 import platform
@@ -16,18 +17,22 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 
-PIPELINE_VERSION = 1
+PIPELINE_VERSION = 2
 PROJECT_DIR = Path(__file__).resolve().parent
 TARGET_DIR = PROJECT_DIR.parent / "target"
 TODO_DIR = TARGET_DIR / "todo"
 OUTPUT_DIR = TARGET_DIR / "markdown"
 COMBINED_PATH = TARGET_DIR / "combined.md"
 MANIFEST_PATH = TARGET_DIR / ".manifest.json"
+
+# Docling reads its settings at import time, so keep its model cache beside the other caches.
+os.environ.setdefault("DOCLING_CACHE_DIR", str(TARGET_DIR / ".cache" / "docling"))
 
 IMAGE_EXTENSIONS = {".bmp", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 AUDIO_EXTENSIONS = {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".wma"}
@@ -40,13 +45,16 @@ DOCUMENT_EXTENSIONS = {
     ".doc", ".docx", ".eml", ".epub", ".htm", ".html", ".msg", ".odt", ".pdf",
     ".ppt", ".pptx", ".rtf", ".xls", ".xlsx", ".xml", ".zip",
 }
+# Layout-aware formats that Docling handles better than MarkItDown (tables, scans, figures).
+DOCLING_EXTENSIONS = {".docx", ".htm", ".html", ".pdf", ".pptx", ".xlsx"}
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Digest ../target/todo into Markdown for LLMs. Sources are never deleted or moved."
     )
-    parser.add_argument("command", nargs="?", choices=("run", "doctor"), default="run")
+    parser.add_argument("command", nargs="?", choices=("run", "doctor", "prefetch"), default="run")
     parser.add_argument("--force", action="store_true", help="Reprocess files even when unchanged.")
     parser.add_argument("--backend", choices=("auto", "mlx", "faster-whisper"), default="auto")
     parser.add_argument(
@@ -65,6 +73,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--ollama-url",
         default="http://127.0.0.1:11434/api/chat",
         help="Local Ollama chat endpoint used only with --vision-model.",
+    )
+    parser.add_argument(
+        "--doc-engine",
+        choices=("auto", "docling", "markitdown"),
+        default="auto",
+        help="Document converter. Auto uses Docling for PDF/DOCX/PPTX/XLSX/HTML when installed, else MarkItDown.",
+    )
+    parser.add_argument(
+        "--force-ocr",
+        action="store_true",
+        help="OCR every PDF page even when it has a text layer. Use for scans with a garbled hidden text layer.",
+    )
+    parser.add_argument(
+        "--table-mode",
+        choices=("accurate", "fast"),
+        default="accurate",
+        help="Docling table-structure model. Accurate is slower and handles merged cells and dense grids better.",
     )
     return parser.parse_args(argv)
 
@@ -282,11 +307,124 @@ class SpeechTranscriber:
         return "\n\n".join(lines) or "_No speech detected._", metadata
 
 
+def docling_available() -> bool:
+    try:
+        import docling  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def loopback_chat_url(ollama_url: str) -> str:
+    """Return Ollama's OpenAI-compatible chat URL, refusing any non-loopback host."""
+    parts = urllib.parse.urlsplit(ollama_url)
+    if parts.hostname not in LOOPBACK_HOSTS:
+        raise RuntimeError(f"Refusing non-loopback vision endpoint: {ollama_url}")
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, "/v1/chat/completions", "", ""))
+
+
+def _drop_osd_noise(record: logging.LogRecord) -> bool:
+    # Docling runs Tesseract orientation detection on every OCR crop. Crops with little text (logos,
+    # stamps, rules) fail it, but OCR still runs because we always pass explicit languages.
+    return not record.getMessage().startswith("OSD failed")
+
+
+class DoclingConverter:
+    """Layout-aware conversion: reading order, table structure, scanned-page OCR, figure descriptions."""
+
+    def __init__(self, args: argparse.Namespace, ocr_languages: str) -> None:
+        self.args = args
+        self.ocr_languages = ocr_languages
+        self._converter: Any = None
+
+    @staticmethod
+    def version() -> str:
+        from importlib.metadata import version
+
+        return version("docling")
+
+    def _build(self) -> Any:
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import (
+            PdfPipelineOptions,
+            PictureDescriptionApiOptions,
+            TableFormerMode,
+            TesseractCliOcrOptions,
+        )
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+
+        logging.getLogger("docling.models.stages.ocr.tesseract_ocr_cli_model").addFilter(_drop_osd_noise)
+        options = PdfPipelineOptions()
+        options.do_ocr = True
+        options.ocr_options = TesseractCliOcrOptions(
+            lang=self.ocr_languages.split("+"), force_full_page_ocr=self.args.force_ocr
+        )
+        options.do_table_structure = True
+        options.table_structure_options.mode = (
+            TableFormerMode.ACCURATE if self.args.table_mode == "accurate" else TableFormerMode.FAST
+        )
+        options.table_structure_options.do_cell_matching = True
+        if self.args.vision_model:
+            options.enable_remote_services = True  # loopback Ollama only; see loopback_chat_url
+            options.do_picture_description = True
+            options.picture_description_options = PictureDescriptionApiOptions(
+                url=loopback_chat_url(self.args.ollama_url),
+                params={"model": self.args.vision_model, "temperature": 0},
+                prompt=(
+                    "Describe this figure for a later language model. If it is a chart or diagram, state its "
+                    "type, title, axes, series, and every readable label and number exactly. If it is a photo, "
+                    "state the visible objects and text. Do not invent details."
+                ),
+                timeout=600,
+            )
+        format_options = {InputFormat.PDF: PdfFormatOption(pipeline_options=options)}
+        return DocumentConverter(format_options=format_options)
+
+    def convert(self, path: Path) -> tuple[str, dict[str, Any]]:
+        from docling.datamodel.base_models import ConversionStatus
+
+        if self._converter is None:
+            self._converter = self._build()
+        result = self._converter.convert(str(path), raises_on_error=False)
+        if result.status not in (ConversionStatus.SUCCESS, ConversionStatus.PARTIAL_SUCCESS):
+            errors = "; ".join(str(getattr(error, "error_message", error)) for error in result.errors)
+            raise RuntimeError(f"Docling status {result.status.value}: {errors or 'no details'}")
+        document = result.document
+        pages = sorted(document.pages)
+        if len(pages) > 1:
+            chunks = []
+            for number in pages:
+                text = document.export_to_markdown(page_no=number).strip()
+                if text:
+                    chunks.append(f"<!-- page {number} -->\n\n{text}")
+            markdown = "\n\n".join(chunks)
+        else:
+            markdown = document.export_to_markdown().strip()
+        metadata: dict[str, Any] = {
+            "processor": "docling",
+            "docling_version": self.version(),
+            "docling_status": result.status.value,
+            "pages": len(pages),
+            "tables": len(document.tables),
+            "pictures": len(document.pictures),
+            "ocr_languages": self.ocr_languages,
+            "table_mode": self.args.table_mode,
+        }
+        if self.args.vision_model:
+            metadata["vision_model"] = self.args.vision_model
+        return markdown, metadata
+
+
 class Converter:
     def __init__(self, args: argparse.Namespace, ocr_languages: str) -> None:
         self.args = args
         self.ocr_languages = ocr_languages
         self.speech = SpeechTranscriber(args.backend, args.model, args.language)
+        self.docling: DoclingConverter | None = None
+        if args.doc_engine == "docling" and not docling_available():
+            raise RuntimeError("--doc-engine docling requested but docling is not installed")
+        if args.doc_engine != "markitdown" and docling_available():
+            self.docling = DoclingConverter(args, ocr_languages)
         self._markitdown: Any = None
 
     def convert(self, path: Path, kind: str) -> tuple[str, dict[str, Any]]:
@@ -300,7 +438,7 @@ class Converter:
         if kind == "text":
             return self.convert_text(path), {"processor": "plain-text"}
         if kind == "document":
-            return self.convert_document(path), {"processor": "markitdown"}
+            return self.convert_document(path)
         return (
             "## Conversion status\n\nThis file type is not supported. The source metadata is preserved above.",
             {"processor": "metadata-only"},
@@ -333,7 +471,22 @@ class Converter:
         fence = "````" if "```" in text else "```"
         return f"## Source content\n\n{fence}{language}\n{text}\n{fence}"
 
-    def convert_document(self, path: Path) -> str:
+    def convert_document(self, path: Path) -> tuple[str, dict[str, Any]]:
+        fallback: dict[str, Any] = {}
+        if self.docling and path.suffix.lower() in DOCLING_EXTENSIONS:
+            try:
+                markdown, metadata = self.docling.convert(path)
+                if markdown:
+                    return f"## Extracted content\n\n{markdown}", metadata
+                fallback["docling_fallback"] = "Docling returned no text"
+            except Exception as exc:
+                if self.args.doc_engine == "docling":
+                    raise
+                print(f"  Docling failed, falling back to MarkItDown: {type(exc).__name__}: {exc}", file=sys.stderr)
+                fallback["docling_fallback"] = f"{type(exc).__name__}: {exc}"
+        return self.convert_markitdown(path), {"processor": "markitdown", **fallback}
+
+    def convert_markitdown(self, path: Path) -> str:
         if self._markitdown is None:
             from markitdown import MarkItDown
 
@@ -463,6 +616,10 @@ def config_key(args: argparse.Namespace, converter: Converter) -> dict[str, Any]
         "language": args.language,
         "ocr_languages": converter.ocr_languages,
         "vision_model": args.vision_model,
+        "doc_engine": "docling" if converter.docling else "markitdown",
+        "docling_version": converter.docling.version() if converter.docling else None,
+        "force_ocr": args.force_ocr,
+        "table_mode": args.table_mode,
     }
 
 
@@ -520,6 +677,10 @@ def doctor() -> int:
     except ImportError:
         print("MarkItDown: MISSING")
         failures.append("markitdown")
+    if docling_available():
+        print(f"Docling: {DoclingConverter.version()} (layout, tables, scanned-page OCR)")
+    else:
+        print("Docling: not installed (optional; PDFs fall back to MarkItDown)")
     speech_module = "mlx_whisper" if platform.system() == "Darwin" and platform.machine() == "arm64" else "faster_whisper"
     try:
         __import__(speech_module)
@@ -532,6 +693,20 @@ def doctor() -> int:
         print(f"Doctor failed: {', '.join(failures)}", file=sys.stderr)
         return 1
     print("Doctor passed.")
+    return 0
+
+
+def prefetch() -> int:
+    """Download Docling layout and table models into target/.cache so later runs work offline."""
+    if not docling_available():
+        print("Docling is not installed.", file=sys.stderr)
+        return 1
+    from docling.utils.model_downloader import download_models
+
+    ensure_layout()
+    path = download_models(with_layout=True, with_tableformer=True, with_code_formula=False,
+                           with_picture_classifier=False, with_rapidocr=False, progress=True)
+    print(f"Docling models ready: {path}")
     return 0
 
 
@@ -604,6 +779,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     if args.command == "doctor":
         return doctor()
+    if args.command == "prefetch":
+        return prefetch()
     return process(args)
 
 

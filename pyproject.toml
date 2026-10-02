@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Local, privacy-first WhatsApp media and document to Markdown digestion pipeline"
 requires-python = ">=3.12,<3.14"
 dependencies = [
+  "docling>=2.55",
   "markitdown[docx,outlook,pdf,pptx,xls,xlsx]>=0.1.4",
   "mlx-whisper>=0.4.2",
   "pillow>=11.1.0",

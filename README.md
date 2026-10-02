@@ -21,7 +21,8 @@ To add more material, copy it into `../target/todo` and run `./run.sh` again. Or
 | OPUS, MP3, WAV, M4A, and other audio | MLX-Whisper on Apple silicon | Timestamped speech transcript |
 | MP4, MOV, MKV, and other video | Whisper + FFmpeg + Tesseract | Audio transcript and OCR from three representative frames |
 | JPG, PNG, WebP, TIFF, and other images | Tesseract | Dimensions and OCR text |
-| PDF, DOCX, PPTX, XLSX, HTML, EPUB, email, ZIP | Microsoft MarkItDown | Structured Markdown; ZIP contents are traversed |
+| PDF, DOCX, PPTX, XLSX, HTML | Docling (layout model, TableFormer, Tesseract OCR) | Reading-order Markdown with real tables, scanned-page OCR, `<!-- page N -->` markers, optional figure descriptions |
+| EPUB, email, ZIP, legacy Office | Microsoft MarkItDown | Structured Markdown; ZIP contents are traversed |
 | Markdown, text, JSON, CSV, source code | Built-in text reader | Verbatim fenced content |
 | Unknown binary formats | Metadata only | Name, MIME type, size, timestamp, and checksum |
 
@@ -30,6 +31,18 @@ Every output has YAML front matter with its source path, SHA-256 checksum, proce
 ## Useful commands
 
 ```bash
+# Download Docling models once (about 1 GB), so PDF runs work offline afterwards
+./run.sh prefetch
+
+# Complex scans: OCR every page even if a bad text layer exists
+./run.sh --force-ocr
+
+# Faster, less exact table model
+./run.sh --table-mode fast
+
+# Force or disable Docling
+./run.sh --doc-engine markitdown
+
 # Verify dependencies without processing files
 ./run.sh doctor
 
@@ -54,7 +67,7 @@ ollama pull qwen3-vl:2b
 ./run.sh --vision-model qwen3-vl:2b
 ```
 
-That adds a factual visual description alongside Tesseract OCR. The model is about 1.9 GB. The request goes only to `127.0.0.1`; no cloud API is configured.
+That adds a factual visual description alongside Tesseract OCR. The same model also describes figures and charts inside PDFs, DOCX, and PPTX files. The model is about 1.9 GB. The request goes only to `127.0.0.1`; no cloud API is configured.
 
 ## OCR languages
 
@@ -105,7 +118,8 @@ This pipeline is built for zero external data exposure and local-first execution
 ## Limits
 
 - Tesseract-only image processing extracts text but does not infer the scene. Enable the optional Ollama vision model when image meaning matters.
-- MarkItDown favors token-efficient LLM input over pixel-perfect document reproduction. Complex scanned PDFs and tables may need a heavier Docling pass.
+- Docling is used for PDF, DOCX, PPTX, XLSX, and HTML. If it fails on a file, the pipeline falls back to MarkItDown and records `docling_fallback` in the front matter. Figures without `--vision-model` appear as `<!-- image -->` placeholders.
+- Docling downloads its models on first use (or via `./run.sh prefetch`) and is slower than MarkItDown, especially on large scanned PDFs.
 - Speech-to-text can mishear names, numbers, and very short clips. Keep the original files and check important details against them.
 - Video processing samples three frames; it does not describe every visual change.
 

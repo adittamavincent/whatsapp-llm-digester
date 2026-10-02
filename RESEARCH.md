@@ -28,7 +28,11 @@ Tesseract is small and deterministic for visible text. A local vision-language m
 
 - [Ollama Qwen3-VL model page](https://ollama.com/library/qwen3-vl)
 
-## Alternative considered: Docling
+## Docling (now used for layout-heavy documents)
+
+Docling was originally deferred. It is now the default converter for PDF, DOCX, PPTX, XLSX, and HTML because tables, scans, and figures need layout analysis. MarkItDown remains the fallback and handles the other formats.
+
+## Original assessment of Docling
 
 Docling now has broad local support for PDFs, Office files, images, audio, and video, with strong layout, table, OCR, and representative-frame handling. It is the better upgrade when complex scanned documents are the main workload. For this mixed WhatsApp export, the heavier dependency and model footprint were unnecessary because dedicated Whisper handles the dominant audio workload and MarkItDown handles the small document set.
 
