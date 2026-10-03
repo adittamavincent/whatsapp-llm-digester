@@ -2,6 +2,49 @@
 
 Checked on 25 September 2026. The goal was a private, quick local pipeline rather than the most elaborate document-understanding stack.
 
+## PDF and image OCR update: 2 October 2026
+
+The new quality route uses the complete **PaddleOCR-VL-1.6** pipeline. The developer reports 96.33 on OmniDocBench v1.6 and tests across scan, skew, warping, screen photography, and uneven lighting. This benchmark result is not a measured accuracy for this project's Indonesian documents. The compact 0.9B recognition model is a reasonable candidate for this Apple-silicon Mac with 16 GB RAM.
+
+The full pipeline combines layout analysis and region recognition. Running the VLM alone does not reproduce it. This integration retains footnotes and marginal text, enables chart recognition, and uses the official Apple CPU runtime. A loopback MLX-VLM backend is optional for acceleration. The Apple guide reports validation on M4; compatibility and speed on another Mac still need local checks.
+
+- [PaddleOCR-VL-1.6 technical documentation](https://github.com/PaddlePaddle/PaddleOCR/blob/main/docs/version3.x/algorithm/PaddleOCR-VL/PaddleOCR-VL-1.6.en.md)
+- [Full pipeline and Python API](https://github.com/PaddlePaddle/PaddleOCR/blob/main/docs/version3.x/pipeline_usage/PaddleOCR-VL.en.md)
+- [Official Apple Silicon setup](https://github.com/PaddlePaddle/PaddleOCR/blob/main/docs/version3.x/pipeline_usage/PaddleOCR-VL-Apple-Silicon.en.md)
+
+Other candidates were checked before choosing this route:
+
+| Candidate | Evidence and fit |
+| --- | --- |
+| GLM-OCR | Compact 0.9B parser with an official MLX deployment example. A viable alternative for local evaluation. |
+| Jina-OCR-v1 | September 2026 release, 3B model. Its paper reports 91.14 on OmniDocBench v1.6 and emphasizes inference throughput. Newer release date alone does not establish better extraction for this workload. |
+| olmOCR 2 | 7B model; its official local toolkit targets NVIDIA GPUs with at least 12 GB VRAM. Less convenient for this machine than the compact Paddle pipeline. |
+| MinerU | Complete document parsing toolkit with local Apple support; worth comparing on scientific documents. Its pipeline and quality tiers differ from this integration. |
+| Docling | Already installed here. Retained for Office/HTML and the original PDF route. Installing it does not replace the selected Tesseract OCR with a newer OCR VLM. |
+
+- [GLM-OCR official MLX deployment](https://github.com/zai-org/GLM-OCR/blob/main/examples/mlx-deploy/README.md)
+- [olmOCR official requirements and evaluation](https://github.com/allenai/olmocr)
+- [MinerU official project](https://github.com/opendatalab/MinerU)
+- [MLX-VLM supported models](https://github.com/Blaizzy/mlx-vlm)
+- [Jina-OCR-v1 paper](https://arxiv.org/abs/2609.03181)
+
+An independent September evaluation reported 95.25 for a different orchestration of the Paddle weights and asked about a formula-score discrepancy. The author explicitly declines a leaderboard ranking. Our settings also differ from the benchmark defaults because they retain footnotes and enable charts, so the published score must not be presented as this integration's accuracy.
+
+- [OmniDocBench issue 258: independent evaluation and configuration differences](https://github.com/opendatalab/OmniDocBench/issues/258)
+
+Forum searches were used to find practical concerns, not to establish benchmark rankings. A recent r/Rag comparison reports different winners for scans, scientific formulas, and general document extraction. A reported MLX-VLM continuous-batching failure with PaddleOCR motivated serial recognition requests in this integration. These reports support testing representative files; they do not prove one universal best model.
+
+- [r/Rag: comparison of self-hosted OCR models](https://www.reddit.com/r/Rag/comments/1wmyoiz/best_open_source_ocr_models_to_replace_textract/)
+- [MLX-VLM issue 1283: variable-batch PaddleOCR failure](https://github.com/Blaizzy/mlx-vlm/issues/1283)
+
+### Local verification
+
+On 2 October 2026, PaddleOCR 3.7.0 / PaddlePaddle 3.3.1 converted a raster-only synthetic Indonesian PDF through the native CPU pipeline. Exact names, invoice identifier, city, prices, and table structure matched the fixture. A second run through MLX-VLM 0.7.4 processed a two-page scanned PDF, a PNG document, and plain chat text into per-source Markdown, a manifest, and `combined.md` in 28.4 seconds with a loaded server and cached models. Source checksums stayed unchanged, and the next run skipped all three unchanged inputs.
+
+The focused suite covers missing/duplicate pages, blank-page markers, retained footnotes, figure-link replacement, local endpoint restrictions, explicit dependency failure, OCR failure propagation, and cache invalidation. Project doctor passed with Metal access. The sandbox itself cannot load MLX's GPU device.
+
+These checks are integration evidence. No comparison on the private WhatsApp corpus or production benchmark was run. Recognition of handwriting, equations, charts, and arbitrary photograph meaning was not measured by these fixtures; figure descriptions still require the separate optional vision model.
+
 ## Chosen stack
 
 ### MarkItDown for documents and archives

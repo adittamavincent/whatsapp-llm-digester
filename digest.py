@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -12,38 +13,106 @@ import logging
 import mimetypes
 import os
 import platform
+import queue
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
 
-
-PIPELINE_VERSION = 2
+PIPELINE_VERSION = 3
 PROJECT_DIR = Path(__file__).resolve().parent
+OCR_PYTHON = (
+    PROJECT_DIR
+    / "ocr"
+    / ".venv"
+    / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+)
 TARGET_DIR = PROJECT_DIR.parent / "target"
 TODO_DIR = TARGET_DIR / "todo"
 OUTPUT_DIR = TARGET_DIR / "markdown"
 COMBINED_PATH = TARGET_DIR / "combined.md"
 MANIFEST_PATH = TARGET_DIR / ".manifest.json"
 
+
+@contextlib.contextmanager
+def target_directory(target: Path):
+    """Use one project's data paths while retaining shared runtimes and model caches."""
+    global TARGET_DIR, TODO_DIR, OUTPUT_DIR, COMBINED_PATH, MANIFEST_PATH
+    previous = TARGET_DIR, TODO_DIR, OUTPUT_DIR, COMBINED_PATH, MANIFEST_PATH
+    TARGET_DIR = target.resolve()
+    TODO_DIR, OUTPUT_DIR = TARGET_DIR / "todo", TARGET_DIR / "markdown"
+    COMBINED_PATH, MANIFEST_PATH = (
+        TARGET_DIR / "combined.md",
+        TARGET_DIR / ".manifest.json",
+    )
+    try:
+        yield
+    finally:
+        TARGET_DIR, TODO_DIR, OUTPUT_DIR, COMBINED_PATH, MANIFEST_PATH = previous
+
+
 # Docling reads its settings at import time, so keep its model cache beside the other caches.
 os.environ.setdefault("DOCLING_CACHE_DIR", str(TARGET_DIR / ".cache" / "docling"))
 
-IMAGE_EXTENSIONS = {".bmp", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+IMAGE_EXTENSIONS = {
+    ".bmp",
+    ".gif",
+    ".heic",
+    ".heif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
 AUDIO_EXTENSIONS = {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".wma"}
 VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 PLAIN_TEXT_EXTENSIONS = {
-    ".cfg", ".conf", ".css", ".csv", ".ini", ".js", ".json", ".jsonl", ".log",
-    ".md", ".py", ".rst", ".sh", ".sql", ".toml", ".ts", ".tsv", ".txt", ".yaml", ".yml",
+    ".cfg",
+    ".conf",
+    ".css",
+    ".csv",
+    ".ini",
+    ".js",
+    ".json",
+    ".jsonl",
+    ".log",
+    ".md",
+    ".py",
+    ".rst",
+    ".sh",
+    ".sql",
+    ".toml",
+    ".ts",
+    ".tsv",
+    ".txt",
+    ".yaml",
+    ".yml",
 }
 DOCUMENT_EXTENSIONS = {
-    ".doc", ".docx", ".eml", ".epub", ".htm", ".html", ".msg", ".odt", ".pdf",
-    ".ppt", ".pptx", ".rtf", ".xls", ".xlsx", ".xml", ".zip",
+    ".doc",
+    ".docx",
+    ".eml",
+    ".epub",
+    ".htm",
+    ".html",
+    ".msg",
+    ".odt",
+    ".pdf",
+    ".ppt",
+    ".pptx",
+    ".rtf",
+    ".xls",
+    ".xlsx",
+    ".xml",
+    ".zip",
 }
 # Layout-aware formats that Docling handles better than MarkItDown (tables, scans, figures).
 DOCLING_EXTENSIONS = {".docx", ".htm", ".html", ".pdf", ".pptx", ".xlsx"}
@@ -52,18 +121,48 @@ LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Digest ../target/todo into Markdown for LLMs. Sources are never deleted or moved."
+        description="Digest ../target/todo into Markdown for LLMs. Sources are never deleted or moved.",
+        epilog="Projects: ./run.sh new NAME; ./run.sh convert NAME [options]; ./run.sh projects. Legacy: ./run.sh run.",
     )
-    parser.add_argument("command", nargs="?", choices=("run", "doctor", "prefetch"), default="run")
-    parser.add_argument("--force", action="store_true", help="Reprocess files even when unchanged.")
-    parser.add_argument("--backend", choices=("auto", "mlx", "faster-whisper"), default="auto")
+    parser.add_argument(
+        "command", nargs="?", choices=("run", "doctor", "prefetch"), default="run"
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="Reprocess files even when unchanged."
+    )
+    parser.add_argument(
+        "--backend", choices=("auto", "mlx", "faster-whisper"), default="auto"
+    )
     parser.add_argument(
         "--model",
         default="auto",
         help="Whisper model. Auto uses mlx-community/whisper-turbo on Apple silicon or turbo elsewhere.",
     )
-    parser.add_argument("--language", default="auto", help="Speech language code, for example id or en; default auto-detects.")
-    parser.add_argument("--ocr-langs", default="auto", help="Tesseract languages, for example eng+ind.")
+    parser.add_argument(
+        "--language",
+        default="auto",
+        help="Speech language code, for example id or en; default auto-detects.",
+    )
+    parser.add_argument(
+        "--ocr-langs", default="auto", help="Tesseract languages, for example eng+ind."
+    )
+    parser.add_argument(
+        "--ocr-engine",
+        choices=("auto", "paddleocr", "tesseract"),
+        default="auto",
+        help="PDF/image OCR. Auto uses the isolated PaddleOCR-VL-1.6 environment when installed, else the original pipeline.",
+    )
+    parser.add_argument(
+        "--ocr-vlm-url",
+        default=None,
+        help="Optional local MLX-VLM server for PaddleOCR acceleration, e.g. http://127.0.0.1:8111/.",
+    )
+    parser.add_argument(
+        "--ocr-timeout",
+        type=int,
+        default=3600,
+        help="PaddleOCR time limit per source in seconds.",
+    )
     parser.add_argument(
         "--vision-model",
         default=None,
@@ -91,7 +190,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="accurate",
         help="Docling table-structure model. Accurate is slower and handles merged cells and dense grids better.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.ocr_timeout <= 0:
+        parser.error("--ocr-timeout must be positive")
+    if args.ocr_vlm_url:
+        from ocr.convert import pipeline_options
+
+        try:
+            pipeline_options(args.ocr_vlm_url)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if args.ocr_engine == "tesseract":
+            parser.error("--ocr-vlm-url requires PaddleOCR")
+    return args
 
 
 def ensure_layout() -> None:
@@ -100,8 +211,12 @@ def ensure_layout() -> None:
     (TARGET_DIR / ".cache").mkdir(parents=True, exist_ok=True)
 
 
-def run_command(command: list[str], *, timeout: int = 300) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout)
+def run_command(
+    command: list[str], *, timeout: int = 300
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command, check=True, capture_output=True, text=True, timeout=timeout
+    )
 
 
 def sha256(path: Path) -> str:
@@ -113,7 +228,7 @@ def sha256(path: Path) -> str:
 
 
 def iso_mtime(path: Path) -> str:
-    return dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc).isoformat()
+    return dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.UTC).isoformat()
 
 
 def yaml_string(value: str) -> str:
@@ -121,7 +236,7 @@ def yaml_string(value: str) -> str:
 
 
 def format_timestamp(seconds: float) -> str:
-    total = max(0, int(round(seconds)))
+    total = max(0, round(seconds))
     hours, remainder = divmod(total, 3600)
     minutes, secs = divmod(remainder, 60)
     if hours:
@@ -156,11 +271,13 @@ def resolve_ocr_languages(requested: str) -> str:
     if requested != "auto":
         missing = set(requested.split("+")) - available
         if missing:
-            raise RuntimeError(f"Tesseract language data is missing: {', '.join(sorted(missing))}")
+            raise RuntimeError(
+                f"Tesseract language data is missing: {', '.join(sorted(missing))}"
+            )
         return requested
     choices = [language for language in ("eng", "ind") if language in available]
     if not choices and available:
-        choices = [sorted(available)[0]]
+        choices = [min(available)]
     if not choices:
         raise RuntimeError("Tesseract is installed but no OCR languages were found")
     return "+".join(choices)
@@ -172,7 +289,7 @@ def image_dimensions(path: Path) -> tuple[int, int] | None:
 
         with Image.open(path) as image:
             return image.size
-    except Exception:
+    except Exception:  # noqa: BLE001 - Optional image metadata must not block conversion.
         return None
 
 
@@ -193,6 +310,7 @@ def strip_thinking(text: str) -> str:
 
 
 def ollama_describe(path: Path, model: str, endpoint: str) -> str:
+    loopback_chat_url(endpoint)
     prompt = (
         "Describe this image for a later language model. State the visible people, objects, setting, "
         "actions, layout, and every readable word. Preserve names and numbers exactly. Separate direct "
@@ -282,7 +400,9 @@ class SpeechTranscriber:
         if self._model is None:
             from faster_whisper import WhisperModel
 
-            self._model = WhisperModel(self.model_name, device="cpu", compute_type="int8")
+            self._model = WhisperModel(
+                self.model_name, device="cpu", compute_type="int8"
+            )
         segments, info = self._model.transcribe(
             str(path),
             language=self.language,
@@ -302,7 +422,9 @@ class SpeechTranscriber:
             "speech_backend": "faster-whisper",
             "speech_model": self.model_name,
             "detected_language": getattr(info, "language", self.language or "unknown"),
-            "language_probability": round(float(getattr(info, "language_probability", 0.0)), 4),
+            "language_probability": round(
+                float(getattr(info, "language_probability", 0.0)), 4
+            ),
         }
         return "\n\n".join(lines) or "_No speech detected._", metadata
 
@@ -318,9 +440,11 @@ def docling_available() -> bool:
 def loopback_chat_url(ollama_url: str) -> str:
     """Return Ollama's OpenAI-compatible chat URL, refusing any non-loopback host."""
     parts = urllib.parse.urlsplit(ollama_url)
-    if parts.hostname not in LOOPBACK_HOSTS:
+    if parts.scheme not in {"http", "https"} or parts.hostname not in LOOPBACK_HOSTS:
         raise RuntimeError(f"Refusing non-loopback vision endpoint: {ollama_url}")
-    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, "/v1/chat/completions", "", ""))
+    return urllib.parse.urlunsplit(
+        (parts.scheme, parts.netloc, "/v1/chat/completions", "", "")
+    )
 
 
 def _drop_osd_noise(record: logging.LogRecord) -> bool:
@@ -353,7 +477,9 @@ class DoclingConverter:
         )
         from docling.document_converter import DocumentConverter, PdfFormatOption
 
-        logging.getLogger("docling.models.stages.ocr.tesseract_ocr_cli_model").addFilter(_drop_osd_noise)
+        logging.getLogger(
+            "docling.models.stages.ocr.tesseract_ocr_cli_model"
+        ).addFilter(_drop_osd_noise)
         options = PdfPipelineOptions()
         options.do_ocr = True
         options.ocr_options = TesseractCliOcrOptions(
@@ -361,11 +487,15 @@ class DoclingConverter:
         )
         options.do_table_structure = True
         options.table_structure_options.mode = (
-            TableFormerMode.ACCURATE if self.args.table_mode == "accurate" else TableFormerMode.FAST
+            TableFormerMode.ACCURATE
+            if self.args.table_mode == "accurate"
+            else TableFormerMode.FAST
         )
         options.table_structure_options.do_cell_matching = True
         if self.args.vision_model:
-            options.enable_remote_services = True  # loopback Ollama only; see loopback_chat_url
+            options.enable_remote_services = (
+                True  # loopback Ollama only; see loopback_chat_url
+            )
             options.do_picture_description = True
             options.picture_description_options = PictureDescriptionApiOptions(
                 url=loopback_chat_url(self.args.ollama_url),
@@ -386,9 +516,16 @@ class DoclingConverter:
         if self._converter is None:
             self._converter = self._build()
         result = self._converter.convert(str(path), raises_on_error=False)
-        if result.status not in (ConversionStatus.SUCCESS, ConversionStatus.PARTIAL_SUCCESS):
-            errors = "; ".join(str(getattr(error, "error_message", error)) for error in result.errors)
-            raise RuntimeError(f"Docling status {result.status.value}: {errors or 'no details'}")
+        if result.status not in (
+            ConversionStatus.SUCCESS,
+            ConversionStatus.PARTIAL_SUCCESS,
+        ):
+            errors = "; ".join(
+                str(getattr(error, "error_message", error)) for error in result.errors
+            )
+            raise RuntimeError(
+                f"Docling status {result.status.value}: {errors or 'no details'}"
+            )
         document = result.document
         pages = sorted(document.pages)
         if len(pages) > 1:
@@ -415,17 +552,200 @@ class DoclingConverter:
         return markdown, metadata
 
 
+def paddleocr_available() -> bool:
+    site_packages = PROJECT_DIR / "ocr" / ".venv" / "lib"
+    return OCR_PYTHON.is_file() and any(
+        site_packages.glob("python*/site-packages/paddleocr-*.dist-info")
+    )
+
+
+def resolve_ocr_engine(requested: str) -> str:
+    available = paddleocr_available()
+    if requested == "paddleocr" and not available:
+        raise RuntimeError(
+            "PaddleOCR requested but its environment is missing. Run ./setup-ocr.sh first."
+        )
+    if requested == "auto":
+        return "paddleocr" if available else "tesseract"
+    return requested
+
+
+class PaddleOCRConverter:
+    """Use the isolated runtime without changing Docling/Whisper dependencies."""
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self._worker = None
+        self._reader = None
+        self._log = None
+        self.log_path = PROJECT_DIR / ".cache" / "paddleocr" / "converter.log"
+
+    def _start_worker(self) -> None:
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log = self.log_path.open("a", encoding="utf-8")
+        command = [str(OCR_PYTHON), str(PROJECT_DIR / "ocr" / "convert.py"), "--worker"]
+        if self.args.ocr_vlm_url:
+            command.extend(["--vlm-url", self.args.ocr_vlm_url])
+        print(
+            f"  Loading OCR models once for this worker. Log: {self.log_path}",
+            flush=True,
+        )
+        try:
+            self._worker = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=self._log,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
+            )
+        except BaseException:
+            self.close()
+            raise
+        self._responses = queue.Queue()
+        # Capture these handles so a restarted worker cannot reuse an old reader's queue.
+        responses, stdout = self._responses, self._worker.stdout
+
+        def read_responses():
+            try:
+                for line in stdout:
+                    responses.put(line)
+            finally:
+                responses.put(None)
+
+        self._reader = threading.Thread(target=read_responses, daemon=True)
+        self._reader.start()
+
+    def close(self) -> None:
+        if self._worker is not None:
+            if self._worker.poll() is None:
+                self._worker.terminate()
+                try:
+                    self._worker.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._worker.kill()
+                    self._worker.wait()
+            if self._worker.stdin:
+                with contextlib.suppress(OSError):
+                    self._worker.stdin.close()
+            if self._reader:
+                self._reader.join(timeout=5)
+            if self._worker.stdout:
+                self._worker.stdout.close()
+            self._worker = None
+            self._reader = None
+        if self._log is not None:
+            self._log.close()
+            self._log = None
+
+    def _request(self, path: Path, output: Path) -> None:
+        if self._worker is None:
+            self._start_worker()
+        try:
+            self._worker.stdin.write(
+                json.dumps({"source": str(path.resolve()), "output": str(output)})
+                + "\n"
+            )
+            self._worker.stdin.flush()
+            line = self._responses.get(timeout=self.args.ocr_timeout)
+            if line is None:
+                raise RuntimeError("OCR worker exited before returning a result")
+            response = json.loads(line)
+            if not isinstance(response, dict) or not isinstance(
+                response.get("ok"), bool
+            ):
+                raise ValueError("invalid OCR worker response")  # noqa: TRY004 - This is a protocol error.
+        except queue.Empty as exc:
+            self.close()
+            raise RuntimeError(
+                f"PaddleOCR exceeded {self.args.ocr_timeout}s for {path.name}; see {self.log_path}"
+            ) from exc
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.close()
+            tail = "\n".join(
+                self.log_path.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()[-15:]
+            )
+            raise RuntimeError(
+                f"PaddleOCR worker failed for {path.name}: {exc}. Log: {self.log_path}\n{tail}"
+            ) from exc
+        if not response.get("ok"):
+            raise RuntimeError(
+                f"PaddleOCR failed for {path.name}: {response.get('error', 'unknown error')}; see {self.log_path}"
+            )
+
+    @staticmethod
+    def versions() -> dict[str, str]:
+        result = run_command(
+            [
+                str(OCR_PYTHON),
+                "-c",
+                (
+                    "import json; from importlib.metadata import version; "
+                    "from importlib.metadata import distributions; "
+                    "installed = {d.metadata['Name'].lower() for d in distributions()}; "
+                    "print(json.dumps({p: version(p) for p in ('paddleocr', 'paddlepaddle', 'paddlex', 'mlx-vlm') if p in installed}))"
+                ),
+            ],
+            timeout=30,
+        )
+        return json.loads(result.stdout)
+
+    def convert(self, path: Path) -> tuple[str, dict[str, Any]]:
+        with tempfile.TemporaryDirectory(prefix="whatsapp-digester-ocr-") as temporary:
+            output = Path(temporary) / "result.json"
+            self._request(path, output)
+            result = json.loads(output.read_text(encoding="utf-8"))
+            markdown = result["markdown"]
+            metadata = result["metadata"]
+            described = 0
+            for figure in result.get("figures", []):
+                number, page = figure["number"], figure["page"]
+                marker = f"_[Figure {number} on page {page}]_"
+                if self.args.vision_model:
+                    description = ollama_describe(
+                        Path(figure["path"]),
+                        self.args.vision_model,
+                        self.args.ollama_url,
+                    )
+                    replacement = f"**Figure {number}, page {page} (local vision interpretation)**\n\n{description}"
+                    described += 1
+                else:
+                    replacement = f"_Figure {number} on page {page}: visual description unavailable; check the source._"
+                markdown = markdown.replace(marker, replacement)
+            metadata["figures_described"] = described
+            if self.args.vision_model:
+                metadata["vision_model"] = self.args.vision_model
+            return markdown, metadata
+
+
 class Converter:
     def __init__(self, args: argparse.Namespace, ocr_languages: str) -> None:
         self.args = args
         self.ocr_languages = ocr_languages
+        self.ocr_engine = resolve_ocr_engine(args.ocr_engine)
+        if args.ocr_vlm_url and self.ocr_engine != "paddleocr":
+            raise RuntimeError(
+                "--ocr-vlm-url requires the OCR environment; run ./setup-ocr.sh --extra metal"
+            )
+        self.paddle = (
+            PaddleOCRConverter(args) if self.ocr_engine == "paddleocr" else None
+        )
         self.speech = SpeechTranscriber(args.backend, args.model, args.language)
         self.docling: DoclingConverter | None = None
         if args.doc_engine == "docling" and not docling_available():
-            raise RuntimeError("--doc-engine docling requested but docling is not installed")
+            raise RuntimeError(
+                "--doc-engine docling requested but docling is not installed"
+            )
         if args.doc_engine != "markitdown" and docling_available():
             self.docling = DoclingConverter(args, ocr_languages)
         self._markitdown: Any = None
+
+    def close(self) -> None:
+        if self.paddle:
+            self.paddle.close()
 
     def convert(self, path: Path, kind: str) -> tuple[str, dict[str, Any]]:
         if kind == "image":
@@ -446,16 +766,22 @@ class Converter:
 
     def convert_image(self, path: Path) -> tuple[str, dict[str, Any]]:
         dimensions = image_dimensions(path)
-        ocr = image_ocr(path, self.ocr_languages)
+        if self.paddle:
+            ocr, metadata = self.paddle.convert(path)
+        else:
+            ocr = image_ocr(path, self.ocr_languages)
+            metadata = {"processor": "tesseract", "ocr_languages": self.ocr_languages}
         sections = []
         if self.args.vision_model:
-            description = ollama_describe(path, self.args.vision_model, self.args.ollama_url)
-            sections.append(f"## Local vision description\n\n{description or '_No description returned._'}")
+            description = ollama_describe(
+                path, self.args.vision_model, self.args.ollama_url
+            )
+            sections.append(
+                f"## Local vision description\n\n{description or '_No description returned._'}"
+            )
         sections.append(f"## OCR text\n\n{ocr or '_No readable text detected._'}")
-        metadata: dict[str, Any] = {
-            "processor": "tesseract" + ("+ollama" if self.args.vision_model else ""),
-            "ocr_languages": self.ocr_languages,
-        }
+        if self.args.vision_model:
+            metadata["processor"] += "+ollama"
         if dimensions:
             metadata["width_px"], metadata["height_px"] = dimensions
         if self.args.vision_model:
@@ -472,6 +798,9 @@ class Converter:
         return f"## Source content\n\n{fence}{language}\n{text}\n{fence}"
 
     def convert_document(self, path: Path) -> tuple[str, dict[str, Any]]:
+        if self.paddle and path.suffix.lower() == ".pdf":
+            markdown, metadata = self.paddle.convert(path)
+            return f"## Extracted content\n\n{markdown}", metadata
         fallback: dict[str, Any] = {}
         if self.docling and path.suffix.lower() in DOCLING_EXTENSIONS:
             try:
@@ -482,7 +811,10 @@ class Converter:
             except Exception as exc:
                 if self.args.doc_engine == "docling":
                     raise
-                print(f"  Docling failed, falling back to MarkItDown: {type(exc).__name__}: {exc}", file=sys.stderr)
+                print(
+                    f"  Docling failed, falling back to MarkItDown: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
                 fallback["docling_fallback"] = f"{type(exc).__name__}: {exc}"
         return self.convert_markitdown(path), {"processor": "markitdown", **fallback}
 
@@ -492,7 +824,9 @@ class Converter:
 
             self._markitdown = MarkItDown()
         result = self._markitdown.convert_local(str(path))
-        markdown = getattr(result, "markdown", None) or getattr(result, "text_content", None)
+        markdown = getattr(result, "markdown", None) or getattr(
+            result, "text_content", None
+        )
         if not markdown or not markdown.strip():
             return "## Extracted content\n\n_No text was extracted from this document._"
         return f"## Extracted content\n\n{markdown.strip()}"
@@ -505,24 +839,39 @@ class Converter:
             if frames:
                 frame_sections = []
                 for timestamp, frame in frames:
-                    ocr = image_ocr(frame, self.ocr_languages)
+                    ocr = (
+                        self.paddle.convert(frame)[0]
+                        if self.paddle
+                        else image_ocr(frame, self.ocr_languages)
+                    )
                     detail = f"OCR: {ocr}" if ocr else "OCR: no readable text detected."
                     if self.args.vision_model:
-                        detail = ollama_describe(frame, self.args.vision_model, self.args.ollama_url) + f"\n\n{detail}"
-                    frame_sections.append(f"### Frame at {format_timestamp(timestamp)}\n\n{detail}")
-                sections.append("## Representative video frames\n\n" + "\n\n".join(frame_sections))
+                        detail = (
+                            ollama_describe(
+                                frame, self.args.vision_model, self.args.ollama_url
+                            )
+                            + f"\n\n{detail}"
+                        )
+                    frame_sections.append(
+                        f"### Frame at {format_timestamp(timestamp)}\n\n{detail}"
+                    )
+                sections.append(
+                    "## Representative video frames\n\n" + "\n\n".join(frame_sections)
+                )
         finally:
             if frames:
                 shutil.rmtree(frames[0][1].parent, ignore_errors=True)
         metadata.update(
             {
-                "processor": metadata["speech_backend"] + "+ffmpeg+tesseract",
+                "processor": metadata["speech_backend"] + "+ffmpeg+" + self.ocr_engine,
                 "ocr_languages": self.ocr_languages,
                 "sampled_frames": len(frames),
             }
         )
         if self.args.vision_model:
             metadata["vision_model"] = self.args.vision_model
+        if self.paddle:
+            metadata["ocr_model"] = "PaddlePaddle/PaddleOCR-VL-1.6"
         return "\n\n".join(sections), metadata
 
     @staticmethod
@@ -530,15 +879,23 @@ class Converter:
         try:
             probe = run_command(
                 [
-                    "ffprobe", "-v", "error", "-show_entries", "format=duration",
-                    "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(path),
                 ],
                 timeout=60,
             )
             duration = float(probe.stdout.strip())
         except (ValueError, subprocess.SubprocessError):
             return []
-        timestamps = sorted({round(duration * ratio, 3) for ratio in (0.2, 0.5, 0.8) if duration > 0})
+        timestamps = sorted(
+            {round(duration * ratio, 3) for ratio in (0.2, 0.5, 0.8) if duration > 0}
+        )
         frame_dir = Path(tempfile.mkdtemp(prefix="whatsapp-llm-digester-frames-"))
         frames: list[tuple[float, Path]] = []
         for index, timestamp in enumerate(timestamps, start=1):
@@ -546,8 +903,20 @@ class Converter:
             try:
                 run_command(
                     [
-                        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", str(timestamp),
-                        "-i", str(path), "-frames:v", "1", "-q:v", "2", str(frame),
+                        "ffmpeg",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-ss",
+                        str(timestamp),
+                        "-i",
+                        str(path),
+                        "-frames:v",
+                        "1",
+                        "-q:v",
+                        "2",
+                        str(frame),
                     ],
                     timeout=120,
                 )
@@ -565,7 +934,9 @@ def output_path_for(source: Path) -> Path:
     return OUTPUT_DIR / relative.parent / f"{relative.name}.md"
 
 
-def render_markdown(source: Path, kind: str, digest: str, body: str, extra: dict[str, Any]) -> str:
+def render_markdown(
+    source: Path, kind: str, digest: str, body: str, extra: dict[str, Any]
+) -> str:
     relative = source.relative_to(TODO_DIR).as_posix()
     mime = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
     metadata: dict[str, Any] = {
@@ -605,7 +976,10 @@ def load_manifest() -> dict[str, Any]:
 
 
 def save_manifest(manifest: dict[str, Any]) -> None:
-    atomic_write(MANIFEST_PATH, json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    atomic_write(
+        MANIFEST_PATH,
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
 
 
 def config_key(args: argparse.Namespace, converter: Converter) -> dict[str, Any]:
@@ -615,6 +989,11 @@ def config_key(args: argparse.Namespace, converter: Converter) -> dict[str, Any]
         "model": converter.speech.model_name,
         "language": args.language,
         "ocr_languages": converter.ocr_languages,
+        "ocr_engine": converter.ocr_engine,
+        "ocr_vlm_url": args.ocr_vlm_url,
+        "ocr_pipeline": "v1.6" if converter.paddle else None,
+        "ocr_timeout": args.ocr_timeout,
+        "ocr_versions": converter.paddle.versions() if converter.paddle else None,
         "vision_model": args.vision_model,
         "doc_engine": "docling" if converter.docling else "markitdown",
         "docling_version": converter.docling.version() if converter.docling else None,
@@ -623,11 +1002,28 @@ def config_key(args: argparse.Namespace, converter: Converter) -> dict[str, Any]
     }
 
 
+def config_for_args(args: argparse.Namespace) -> dict[str, Any]:
+    converter = Converter(args, resolve_ocr_languages(args.ocr_langs))
+    try:
+        return config_key(args, converter)
+    finally:
+        converter.close()
+
+
+def cached_source(source: Path, checksum: str, record: dict, config: dict) -> bool:
+    return (
+        record.get("status") == "success"
+        and record.get("sha256") == checksum
+        and record.get("config") == config
+        and output_path_for(source).is_file()
+    )
+
+
 def combine_outputs(records: dict[str, Any]) -> int:
     parts = [
         "# LLM digestion corpus",
         "",
-        f"Generated: {dt.datetime.now(tz=dt.timezone.utc).isoformat()}",
+        f"Generated: {dt.datetime.now(tz=dt.UTC).isoformat()}",
         "",
         "Each source begins and ends with an HTML comment so an LLM can preserve provenance.",
         "",
@@ -669,7 +1065,9 @@ def doctor() -> int:
     languages = available_tesseract_languages() if shutil.which("tesseract") else []
     print(f"Tesseract languages: {', '.join(languages) or 'none'}")
     if "ind" not in languages:
-        print("Note: Indonesian OCR data is absent; English OCR still recognizes Latin text.")
+        print(
+            "Note: Indonesian OCR data is absent; English OCR still recognizes Latin text."
+        )
     try:
         import markitdown  # noqa: F401
 
@@ -678,10 +1076,16 @@ def doctor() -> int:
         print("MarkItDown: MISSING")
         failures.append("markitdown")
     if docling_available():
-        print(f"Docling: {DoclingConverter.version()} (layout, tables, scanned-page OCR)")
+        print(
+            f"Docling: {DoclingConverter.version()} (layout, tables, scanned-page OCR)"
+        )
     else:
         print("Docling: not installed (optional; PDFs fall back to MarkItDown)")
-    speech_module = "mlx_whisper" if platform.system() == "Darwin" and platform.machine() == "arm64" else "faster_whisper"
+    speech_module = (
+        "mlx_whisper"
+        if platform.system() == "Darwin" and platform.machine() == "arm64"
+        else "faster_whisper"
+    )
     try:
         __import__(speech_module)
         print(f"Speech backend: {speech_module} installed")
@@ -689,6 +1093,9 @@ def doctor() -> int:
         print(f"Speech backend: {speech_module} MISSING")
         failures.append(speech_module)
     print(f"Ollama: {shutil.which('ollama') or 'not installed (optional)'}")
+    print(
+        f"PaddleOCR-VL-1.6: {'installed; auto selects it for PDFs/images/frames' if paddleocr_available() else 'not installed; run ./setup-ocr.sh'}"
+    )
     if failures:
         print(f"Doctor failed: {', '.join(failures)}", file=sys.stderr)
         return 1
@@ -704,8 +1111,14 @@ def prefetch() -> int:
     from docling.utils.model_downloader import download_models
 
     ensure_layout()
-    path = download_models(with_layout=True, with_tableformer=True, with_code_formula=False,
-                           with_picture_classifier=False, with_rapidocr=False, progress=True)
+    path = download_models(
+        with_layout=True,
+        with_tableformer=True,
+        with_code_formula=False,
+        with_picture_classifier=False,
+        with_rapidocr=False,
+        progress=True,
+    )
     print(f"Docling models ready: {path}")
     return 0
 
@@ -714,11 +1127,20 @@ def process(args: argparse.Namespace) -> int:
     ensure_layout()
     ocr_languages = resolve_ocr_languages(args.ocr_langs)
     converter = Converter(args, ocr_languages)
+    try:
+        return process_sources(args, converter)
+    finally:
+        converter.close()
+
+
+def process_sources(args: argparse.Namespace, converter: Converter) -> int:
     current_config = config_key(args, converter)
     manifest = load_manifest()
     records: dict[str, Any] = manifest.setdefault("files", {})
     sources = sorted(
-        path for path in TODO_DIR.rglob("*") if path.is_file() and not path.is_symlink() and path.name != ".DS_Store"
+        path
+        for path in TODO_DIR.rglob("*")
+        if path.is_file() and not path.is_symlink() and path.name != ".DS_Store"
     )
     if not sources:
         print(f"No files found in {TODO_DIR}")
@@ -731,12 +1153,8 @@ def process(args: argparse.Namespace) -> int:
         digest = sha256(source)
         output = output_path_for(source)
         previous = records.get(relative, {})
-        unchanged = (
-            not args.force
-            and previous.get("status") == "success"
-            and previous.get("sha256") == digest
-            and previous.get("config") == current_config
-            and output.is_file()
+        unchanged = not args.force and cached_source(
+            source, digest, previous, current_config
         )
         if unchanged:
             print(f"[{index}/{len(sources)}] skip {relative}")
@@ -752,10 +1170,10 @@ def process(args: argparse.Namespace) -> int:
                 "sha256": digest,
                 "output": output.relative_to(TARGET_DIR).as_posix(),
                 "config": current_config,
-                "processed_utc": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
+                "processed_utc": dt.datetime.now(tz=dt.UTC).isoformat(),
             }
             succeeded += 1
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Record third-party failures per source and continue the batch.
             print(f"  ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
             records[relative] = {
                 "status": "failed",
@@ -763,14 +1181,16 @@ def process(args: argparse.Namespace) -> int:
                 "output": output.relative_to(TARGET_DIR).as_posix(),
                 "config": current_config,
                 "error": f"{type(exc).__name__}: {exc}",
-                "processed_utc": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
+                "processed_utc": dt.datetime.now(tz=dt.UTC).isoformat(),
             }
             failed += 1
         save_manifest(manifest)
 
     included = combine_outputs(records)
     print()
-    print(f"Done: {succeeded} processed, {skipped} unchanged, {failed} failed, {included} in combined.md")
+    print(
+        f"Done: {succeeded} processed, {skipped} unchanged, {failed} failed, {included} in combined.md"
+    )
     print(f"Combined corpus: {COMBINED_PATH}")
     return 1 if failed else 0
 
