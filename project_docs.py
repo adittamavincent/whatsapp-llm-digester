@@ -87,13 +87,23 @@ def render_project(path: Path, state: dict, errors: list[str]) -> None:
     for checksum, checkpoint in sorted(
         state["checkpoints"].items(), key=lambda row: (row[1]["through"] or "", row[0])
     ):
+        label = (
+            "ZIPs"
+            if all(a.lower().endswith(".zip") for a in checkpoint["archives"])
+            else "Inputs"
+        )
+        coverage = (
+            f"{checkpoint['from']} through {checkpoint['through']}"
+            if checkpoint["from"]
+            else "none"
+        )
         report.extend(
             [
                 f"## {checksum[:12]}",
                 "",
-                f"ZIPs: {', '.join(checkpoint['archives'])}",
+                f"{label}: {', '.join(checkpoint['archives'])}",
                 "",
-                f"Coverage: {checkpoint['from']} through {checkpoint['through']}",
+                f"Coverage: {coverage}",
                 "",
                 f"Added: {checkpoint['messages_added']} messages, {checkpoint['media_added']} unique media files.",
                 "",

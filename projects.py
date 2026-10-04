@@ -8,9 +8,11 @@ import copy
 import datetime as dt
 import fcntl
 import hashlib
+import io
 import json
 import re
 import stat
+import tarfile
 import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -165,6 +167,37 @@ def project_lock(path: Path):
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
+ARCHIVE_EXTENSIONS = (
+    ".zip",
+    ".tar",
+    ".tar.gz",
+    ".tgz",
+    ".tar.bz2",
+    ".tbz2",
+    ".tar.xz",
+    ".txz",
+)
+
+
+def is_archive_file(path: Path) -> bool:
+    lower = path.name.lower()
+    return any(lower.endswith(ext) for ext in ARCHIVE_EXTENSIONS)
+
+
+def check_safe_path(filename: str, is_symlink: bool = False) -> PurePosixPath:
+    name = PurePosixPath(filename)
+    if (
+        name.is_absolute()
+        or ".." in name.parts
+        or "\\" in filename
+        or re.match(r"^[A-Za-z]:", filename)
+    ):
+        raise ValueError(f"Unsafe member path: {filename}")
+    if is_symlink:
+        raise ValueError(f"Symlinks are not supported: {filename}")
+    return name
+
+
 def safe_member(info: zipfile.ZipInfo) -> PurePosixPath:
     name = PurePosixPath(info.filename)
     if (
@@ -179,23 +212,52 @@ def safe_member(info: zipfile.ZipInfo) -> PurePosixPath:
     return name
 
 
+def safe_tar_member(info: tarfile.TarInfo) -> PurePosixPath:
+    name = PurePosixPath(info.name)
+    if (
+        name.is_absolute()
+        or ".." in name.parts
+        or "\\" in info.name
+        or re.match(r"^[A-Za-z]:", info.name)
+    ):
+        raise ValueError(f"Unsafe TAR member: {info.name}")
+    if info.issym() or info.islnk() or info.isdev():
+        raise ValueError(f"TAR symlinks are not supported: {info.name}")
+    return name
+
+
+def safe_fs_path(base: Path, path: Path) -> PurePosixPath:
+    if path.is_symlink():
+        raise ValueError(f"Symlinks are not supported: {path.name}")
+    try:
+        rel = path.relative_to(base)
+    except ValueError as exc:
+        raise ValueError(f"Path outside base: {path.name}") from exc
+    name = PurePosixPath(rel.as_posix())
+    if (
+        name.is_absolute()
+        or ".." in name.parts
+        or "\\" in rel.as_posix()
+        or re.match(r"^[A-Za-z]:", rel.as_posix())
+    ):
+        raise ValueError(f"Unsafe member: {path.name}")
+    return name
+
+
 def decode_chat(raw: bytes) -> str:
     return raw.decode(
         "utf-16" if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
     )
 
 
-def read_chat_member(
-    zipped: zipfile.ZipFile, info: zipfile.ZipInfo, order: str
-) -> list[dict] | None:
-    name = PurePosixPath(info.filename)
+def read_chat_data(name: PurePosixPath, raw: bytes, order: str) -> list[dict] | None:
     if name.suffix.lower() != ".txt":
         return None
     named_chat = name.name.lower() == "_chat.txt" or name.stem.lower().startswith(
         "whatsapp chat"
     )
     try:
-        return whatsapp.parse_chat(decode_chat(zipped.read(info)), order)
+        return whatsapp.parse_chat(decode_chat(raw), order)
     except (whatsapp.NoChatMessages, UnicodeError) as exc:
         if named_chat:
             raise ValueError(f"Cannot read chat {name}: {exc}") from exc
@@ -204,10 +266,221 @@ def read_chat_member(
         raise ValueError(f"Cannot read chat {name}: {exc}") from exc
 
 
+def read_chat_member(
+    zipped: zipfile.ZipFile, info: zipfile.ZipInfo, order: str
+) -> list[dict] | None:
+    return read_chat_data(PurePosixPath(info.filename), zipped.read(info), order)
+
+
+def is_chat_file(path: Path, order: str = "day-first") -> bool:
+    if path.suffix.lower() != ".txt":
+        return False
+    name_lower = path.name.lower()
+    if name_lower == "_chat.txt" or name_lower.startswith("whatsapp chat"):
+        return True
+    try:
+        raw = path.read_bytes()[:65536]
+        text = decode_chat(raw)
+        messages = whatsapp.parse_chat(text, order)
+        return len(messages) > 0
+    except Exception:
+        return False
+
+
+def dir_contains_archives(dir_path: Path) -> bool:
+    for p in dir_path.rglob("*"):
+        if p.is_file() and not p.is_symlink():
+            if is_archive_file(p):
+                return True
+    return False
+
+
+def is_export_dir(dir_path: Path, inbox: Path) -> bool:
+    if dir_path == inbox or not dir_path.is_dir() or dir_path.is_symlink():
+        return False
+    if dir_path.name.startswith(".") or dir_path.name == "__MACOSX":
+        return False
+    if dir_contains_archives(dir_path):
+        return False
+    for child in dir_path.iterdir():
+        if child.is_file() and not child.is_symlink() and not child.name.startswith("."):
+            if is_chat_file(child):
+                return True
+    return False
+
+
+def directory_checksum(dir_path: Path) -> str:
+    hasher = hashlib.sha256()
+    for child in sorted(dir_path.rglob("*")):
+        if child.is_file() and not child.is_symlink():
+            if (
+                child.name == ".DS_Store"
+                or child.name.startswith("._")
+                or "__MACOSX" in child.parts
+            ):
+                continue
+            rel = child.relative_to(dir_path).as_posix()
+            file_hash = digest.sha256(child)
+            hasher.update(f"{rel}:{file_hash}\n".encode("utf-8"))
+    return hasher.hexdigest()
+
+
+class InputMember:
+    def __init__(self, name: PurePosixPath, is_dir: bool, open_func):
+        self.name = name
+        self.is_dir = is_dir
+        self.open = open_func
+
+
+class ZipInputSource:
+    def __init__(self, path: Path, project_root: Path):
+        self.path = path
+        self.name = path.name
+        self.relative_path = path.relative_to(project_root).as_posix()
+        self.checksum = digest.sha256(path)
+
+    @contextlib.contextmanager
+    def iter_members(self):
+        with zipfile.ZipFile(self.path) as zipped:
+            members = []
+            for info in zipped.infolist():
+                name = safe_member(info)
+                members.append(
+                    InputMember(
+                        name,
+                        info.is_dir(),
+                        lambda inf=info: zipped.open(inf),
+                    )
+                )
+            yield members
+
+
+class TarInputSource:
+    def __init__(self, path: Path, project_root: Path):
+        self.path = path
+        self.name = path.name
+        self.relative_path = path.relative_to(project_root).as_posix()
+        self.checksum = digest.sha256(path)
+
+    @contextlib.contextmanager
+    def iter_members(self):
+        with tarfile.open(self.path, "r:*") as tar:
+            members = []
+            for info in tar.getmembers():
+                name = safe_tar_member(info)
+                members.append(
+                    InputMember(
+                        name,
+                        info.isdir(),
+                        lambda inf=info: tar.extractfile(inf) or io.BytesIO(),
+                    )
+                )
+            yield members
+
+
+class DirectoryInputSource:
+    def __init__(self, path: Path, project_root: Path):
+        self.path = path
+        self.name = path.name
+        self.relative_path = path.relative_to(project_root).as_posix()
+        self.checksum = directory_checksum(path)
+
+    @contextlib.contextmanager
+    def iter_members(self):
+        members = []
+        for child in sorted(self.path.rglob("*")):
+            if child.is_file() and not child.is_symlink():
+                if (
+                    child.name == ".DS_Store"
+                    or child.name.startswith("._")
+                    or "__MACOSX" in child.parts
+                ):
+                    continue
+                name = safe_fs_path(self.path, child)
+                members.append(
+                    InputMember(
+                        name,
+                        False,
+                        lambda c=child: c.open("rb"),
+                    )
+                )
+        yield members
+
+
+class LooseFileInputSource:
+    def __init__(self, path: Path, project_root: Path):
+        self.path = path
+        self.name = path.name
+        self.relative_path = path.relative_to(project_root).as_posix()
+        self.checksum = digest.sha256(path)
+
+    @contextlib.contextmanager
+    def iter_members(self):
+        name = safe_fs_path(self.path.parent, self.path)
+        yield [
+            InputMember(
+                PurePosixPath(name.name),
+                False,
+                lambda: self.path.open("rb"),
+            )
+        ]
+
+
+def create_input_source(path: Path, project_root: Path):
+    if path.is_dir():
+        return DirectoryInputSource(path, project_root)
+    if is_archive_file(path):
+        if path.name.lower().endswith(".zip"):
+            return ZipInputSource(path, project_root)
+        return TarInputSource(path, project_root)
+    return LooseFileInputSource(path, project_root)
+
+
+def discover_inputs(project_dir: Path) -> list:
+    inbox = project_dir / "input"
+    if not inbox.is_dir() or inbox.is_symlink():
+        return []
+
+    export_dirs = set()
+    for item in sorted(inbox.rglob("*")):
+        if item.is_dir() and is_export_dir(item, inbox):
+            if not any(d in item.parents for d in export_dirs):
+                export_dirs.add(item)
+
+    sources = [
+        DirectoryInputSource(d, project_dir) for d in sorted(export_dirs)
+    ]
+
+    for p in sorted(inbox.rglob("*")):
+        if not p.is_file() or p.is_symlink():
+            continue
+        if p.name == ".DS_Store" or p.name.startswith("._") or "__MACOSX" in p.parts:
+            continue
+        if any(d in p.parents for d in export_dirs):
+            continue
+        sources.append(create_input_source(p, project_dir))
+
+    def sort_key(s):
+        is_chat = isinstance(s, LooseFileInputSource) and is_chat_file(s.path)
+        return (is_chat, s.relative_path)
+
+    sources.sort(key=sort_key)
+    return sources
+
+
+def count_inputs(inbox: Path) -> int:
+    if not inbox.is_dir() or inbox.is_symlink():
+        return 0
+    return len(discover_inputs(inbox.parent))
+
+
 def merge_chat_messages(
     state: dict, chats: list, members: dict, checkpoint: str
 ) -> tuple[list[str], int]:
     lookup = {}
+    for media_id, record in state.get("media", {}).items():
+        for alias in record.get("aliases", []):
+            lookup.setdefault(PurePosixPath(alias).name, set()).add(media_id)
     for name, media_id in members.items():
         lookup.setdefault(PurePosixPath(name).name, set()).add(media_id)
     dates = []
@@ -237,10 +510,33 @@ def merge_chat_messages(
     return dates, added
 
 
+def link_attachments(state: dict) -> bool:
+    lookup = {}
+    for media_id, record in state.get("media", {}).items():
+        for alias in record.get("aliases", []):
+            lookup.setdefault(PurePosixPath(alias).name, set()).add(media_id)
+    changed = False
+    for message in state.get("messages", {}).values():
+        for attachment in whatsapp.attachment_names(message.get("body", "")):
+            for media_id in sorted(lookup.get(PurePosixPath(attachment).name, set())):
+                if media_id not in message["attachments"]:
+                    message["attachments"].append(media_id)
+                    changed = True
+    return changed
+
+
 def import_checkpoint(
-    path: Path, archive: Path, checksum: str, state: dict, order: str
+    path: Path,
+    source_or_archive: Any,
+    checksum: str,
+    state: dict,
+    order: str,
 ) -> tuple[int, int]:
-    # Commit one checkpoint only after all its members have been read and checked.
+    if isinstance(source_or_archive, Path):
+        source = create_input_source(source_or_archive, path)
+    else:
+        source = source_or_archive
+
     updated = copy.deepcopy(state)
     chat_files, members, staged = [], {}, {}
     before_messages, before_media = len(state["messages"]), len(state["media"])
@@ -248,27 +544,34 @@ def import_checkpoint(
         tempfile.TemporaryDirectory(
             prefix="import-", dir=path / ".digester"
         ) as temporary,
-        zipfile.ZipFile(archive) as zipped,
+        source.iter_members() as member_list,
     ):
         stage = Path(temporary)
-        for info in zipped.infolist():
-            name = safe_member(info)
+        for member in member_list:
+            name = member.name
             if (
-                info.is_dir()
+                member.is_dir
                 or name.name == ".DS_Store"
                 or "__MACOSX" in name.parts
                 or name.name.startswith("._")
             ):
                 continue
-            messages = read_chat_member(zipped, info, order)
-            if messages is not None:
-                chat_files.append((name.as_posix(), messages))
-                continue
-            with zipped.open(info) as source, (stage / "member").open("wb") as output:
+            if name.suffix.lower() == ".txt":
+                with member.open() as stream:
+                    raw = stream.read()
+                messages = read_chat_data(name, raw, order)
+                if messages is not None:
+                    chat_files.append((name.as_posix(), messages))
+                    continue
+                content_hash = hashlib.sha256(raw)
+                with (stage / "member").open("wb") as output:
+                    output.write(raw)
+            else:
                 content_hash = hashlib.sha256()
-                for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                    content_hash.update(chunk)
-                    output.write(chunk)
+                with member.open() as stream, (stage / "member").open("wb") as output:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        content_hash.update(chunk)
+                        output.write(chunk)
             media_id = content_hash.hexdigest()
             members[name.as_posix()] = media_id
             if media_id not in updated["media"]:
@@ -293,18 +596,23 @@ def import_checkpoint(
                 staged_file = stage / media_id
                 (stage / "member").replace(staged_file)
                 staged[media_id] = staged_file
+            if (stage / "member").exists():
+                (stage / "member").unlink()
             if name.as_posix() not in record["aliases"]:
                 record["aliases"].append(name.as_posix())
             if checksum not in record["checkpoints"]:
                 record["checkpoints"].append(checksum)
-        if not chat_files:
-            raise ValueError("ZIP contains no recognized WhatsApp chat transcript")
+        if not chat_files and not members:
+            raise ValueError(
+                f"Input contains no recognized WhatsApp chat transcript or media files: {source.name}"
+            )
         dates, added_messages = merge_chat_messages(
             updated, chat_files, members, checksum
         )
-        updated["date_order"] = order
+        if dates:
+            updated["date_order"] = order
         updated["checkpoints"][checksum] = updated["checkpoints"].get(checksum) or {
-            "archives": [archive.relative_to(path).as_posix()],
+            "archives": [source.relative_path],
             "chats": [name for name, _ in chat_files],
             "from": min(dates) if dates else None,
             "through": max(dates) if dates else None,
@@ -313,12 +621,12 @@ def import_checkpoint(
             "media_added": len(updated["media"]) - before_media,
             "members": members,
         }
-        for media_id, source in staged.items():
+        for media_id, source_staged in staged.items():
             destination = (
                 path / "target" / "todo" / updated["media"][media_id]["source"]
             )
             destination.parent.mkdir(parents=True, exist_ok=True)
-            source.replace(destination)
+            source_staged.replace(destination)
         save_state(path, updated)
         state.clear()
         state.update(updated)
@@ -331,13 +639,9 @@ def ingest(path: Path, state: dict, order: str) -> list[str]:
             f"This project was imported with --date-order {state['date_order']}; use the same order"
         )
     errors = []
-    archives = sorted(
-        p
-        for p in (path / "input").rglob("*")
-        if p.is_file() and p.suffix.lower() == ".zip" and not p.is_symlink()
-    )
-    for archive in archives:
-        checksum = digest.sha256(archive)
+    sources = discover_inputs(path)
+    for source in sources:
+        checksum = source.checksum
         previous = state["checkpoints"].get(checksum)
         missing_media = previous and any(
             not (
@@ -346,22 +650,31 @@ def ingest(path: Path, state: dict, order: str) -> list[str]:
             for media_id in previous["members"].values()
         )
         if previous and not missing_media:
-            alias = archive.relative_to(path).as_posix()
+            alias = source.relative_path
             if alias not in previous["archives"]:
                 previous["archives"].append(alias)
                 save_state(path, state)
-            print(f"Checkpoint unchanged: {archive.name}", flush=True)
+            print(f"Checkpoint unchanged: {source.name}", flush=True)
             continue
         try:
-            messages, media = import_checkpoint(path, archive, checksum, state, order)
+            messages, media = import_checkpoint(path, source, checksum, state, order)
             print(
-                f"Imported {archive.name}: {messages} new messages, {media} new media",
+                f"Imported {source.name}: {messages} new messages, {media} new media",
                 flush=True,
             )
-        except (ValueError, OSError, RuntimeError, zipfile.BadZipFile) as exc:
-            error = f"{archive.name}: {exc}"
+        except (
+            ValueError,
+            OSError,
+            RuntimeError,
+            zipfile.BadZipFile,
+            tarfile.TarError,
+        ) as exc:
+            error = f"{source.name}: {exc}"
             errors.append(error)
-            print(f"ZIP ERROR: {error}", flush=True)
+            prefix = "ZIP ERROR" if source.name.lower().endswith(".zip") else "ERROR"
+            print(f"{prefix}: {error}", flush=True)
+    if link_attachments(state):
+        save_state(path, state)
     render_project(path, state, errors)
     return errors
 
@@ -370,12 +683,8 @@ def show_projects() -> int:
     print(f"Projects: {ROOT}")
     for path in sorted(ROOT.iterdir()) if ROOT.exists() else []:
         if path.is_dir() and not path.is_symlink() and SLUG.fullmatch(path.name):
-            zips = sum(
-                1
-                for p in (path / "input").rglob("*")
-                if p.is_file() and p.suffix.lower() == ".zip"
-            )
-            print(f"  {path.name}: {zips} ZIP(s)")
+            inputs = count_inputs(path / "input")
+            print(f"  {path.name}: {inputs} input(s)")
     print(
         "\nCreate: ./run.sh new PROJECT\nDigest: ./run.sh convert PROJECT\nLegacy target: ./run.sh run"
     )
@@ -410,7 +719,7 @@ def main(arguments: list[str]) -> int:
     path = initialize(args.project, args.context)
     if args.command == "new":
         print(
-            f"Project ready: {path}\nDrop export ZIPs into: {path / 'input'}\nThen: ./run.sh convert {args.project}"
+            f"Project ready: {path}\nDrop exports, archives, or media files into: {path / 'input'}\nThen: ./run.sh convert {args.project}"
         )
         return 0
     # Validate converter flags before importing any input.
@@ -422,7 +731,7 @@ def main(arguments: list[str]) -> int:
         )
         if not state["checkpoints"]:
             print(
-                f"No checkpoints imported. Put WhatsApp export ZIPs in {path / 'input'}"
+                f"No checkpoints imported. Put WhatsApp exports, archives, or media files in {path / 'input'}"
             )
             return 1 if errors else 0
         import launch

@@ -3,6 +3,7 @@ import io
 import json
 import shutil
 import stat
+import tarfile
 import tempfile
 import unittest
 import zipfile
@@ -73,6 +74,20 @@ class ProjectTests(unittest.TestCase):
             zipped.writestr(chat_name, chat)
             for member, data in (media or {}).items():
                 zipped.writestr(member, data)
+        return path
+
+    def tar(self, name, chat, media=None, chat_name="_chat.txt"):
+        path = self.path / "input" / name
+        mode = "w:gz" if name.endswith(".gz") or name.endswith(".tgz") else "w"
+        with tarfile.open(path, mode) as tar:
+            data = chat.encode("utf-8")
+            info = tarfile.TarInfo(name=chat_name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+            for member, m_data in (media or {}).items():
+                minfo = tarfile.TarInfo(name=member)
+                minfo.size = len(m_data)
+                tar.addfile(minfo, io.BytesIO(m_data))
         return path
 
     def ingest(self, order="day-first"):
@@ -409,6 +424,100 @@ class ProjectTests(unittest.TestCase):
             (self.root / "another-project/CONTEXT.md").read_text(),
             "Archival curation.\n",
         )
+
+    def test_loose_media_file_in_input_is_imported_and_restored_on_deletion(self):
+        audio_file = self.path / "input" / "System Audio 20261004 1602.mp3"
+        audio_file.write_bytes(b"synthetic audio content")
+        state = self.ingest()
+        self.assertEqual(len(state["checkpoints"]), 1)
+        self.assertEqual(len(state["media"]), 1)
+        self.assertEqual(len(state["messages"]), 0)
+        media_record = next(iter(state["media"].values()))
+        staged = self.path / "target/todo" / media_record["source"]
+        self.assertTrue(staged.is_file())
+        self.assertEqual(staged.read_bytes(), b"synthetic audio content")
+        checkpoints_md = (self.path / "target/checkpoints.md").read_text()
+        self.assertIn("System Audio 20261004 1602.mp3", checkpoints_md)
+
+        # Deleting the staged media is restored from original in input/
+        staged.unlink()
+        self.assertFalse(staged.exists())
+        self.ingest()
+        self.assertTrue(staged.is_file())
+        self.assertEqual(staged.read_bytes(), b"synthetic audio content")
+
+    def test_unzipped_export_directory_is_imported_as_checkpoint(self):
+        export_dir = self.path / "input" / "WhatsApp Chat - Project"
+        export_dir.mkdir(parents=True)
+        (export_dir / "_chat.txt").write_text("[01/10/26, 12:00] Ana: hello <attached: photo.jpg>\n", encoding="utf-8")
+        (export_dir / "photo.jpg").write_bytes(b"photo bytes")
+        state = self.ingest()
+        self.assertEqual(len(state["checkpoints"]), 1)
+        self.assertEqual(len(state["messages"]), 1)
+        self.assertEqual(len(state["media"]), 1)
+        checkpoint = next(iter(state["checkpoints"].values()))
+        self.assertEqual(checkpoint["archives"], ["input/WhatsApp Chat - Project"])
+        msg = next(iter(state["messages"].values()))
+        self.assertEqual(len(msg["attachments"]), 1)
+
+        # Restores missing media from the unzipped directory
+        staged = self.path / "target/todo" / next(iter(state["media"].values()))["source"]
+        staged.unlink()
+        self.ingest()
+        self.assertTrue(staged.is_file())
+
+    def test_tar_archive_is_imported_as_checkpoint(self):
+        self.tar(
+            "export.tar.gz",
+            "[01/10/26, 12:00] Ana: hello from tar",
+            {"attachment.png": b"png data"},
+        )
+        state = self.ingest()
+        self.assertEqual(len(state["checkpoints"]), 1)
+        self.assertEqual(len(state["messages"]), 1)
+        self.assertEqual(len(state["media"]), 1)
+        checkpoint = next(iter(state["checkpoints"].values()))
+        self.assertEqual(checkpoint["archives"], ["input/export.tar.gz"])
+
+    def test_standalone_chat_txt_file_and_loose_media_link_attachments(self):
+        (self.path / "input" / "photo.jpg").write_bytes(b"photo data")
+        (self.path / "input" / "WhatsApp Chat with Bob.txt").write_text(
+            "[01/10/26, 12:00] Bob: look here <attached: photo.jpg>\n", encoding="utf-8"
+        )
+        state = self.ingest()
+        self.assertEqual(len(state["checkpoints"]), 2)
+        self.assertEqual(len(state["messages"]), 1)
+        self.assertEqual(len(state["media"]), 1)
+        msg = next(iter(state["messages"].values()))
+        self.assertEqual(len(msg["attachments"]), 1)
+
+    def test_archive_without_chat_file_imports_media_instead_of_failing(self):
+        archive = self.path / "input" / "just-photos.zip"
+        with zipfile.ZipFile(archive, "w") as zipped:
+            zipped.writestr("photo.jpg", b"photo bytes")
+        state = self.ingest()
+        self.assertEqual(len(state["checkpoints"]), 1)
+        self.assertEqual(len(state["media"]), 1)
+        self.assertEqual(len(state["messages"]), 0)
+
+    def test_count_inputs_with_diverse_input_types(self):
+        # 1. Zip
+        self.zip("one.zip", "[01/10/26, 12:00] Ana: hello")
+        # 2. Loose file
+        (self.path / "input" / "audio.mp3").write_bytes(b"audio")
+        # 3. Export dir
+        export_dir = self.path / "input" / "export-folder"
+        export_dir.mkdir()
+        (export_dir / "_chat.txt").write_text("[01/10/26, 12:00] Ana: hi", encoding="utf-8")
+        # 4. Folder of loose files (not an export dir)
+        loose_dir = self.path / "input" / "recordings"
+        loose_dir.mkdir()
+        (loose_dir / "rec1.mp3").write_bytes(b"rec1")
+        (loose_dir / "rec2.mp3").write_bytes(b"rec2")
+
+        count = projects.count_inputs(self.path / "input")
+        # one.zip (1) + audio.mp3 (1) + export-folder (1) + rec1.mp3 (1) + rec2.mp3 (1) = 5
+        self.assertEqual(count, 5)
 
 
 if __name__ == "__main__":

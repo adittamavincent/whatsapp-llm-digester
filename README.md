@@ -1,6 +1,6 @@
 # whatsapp-llm-digester
 
-This tool digests WhatsApp ZIP exports into separate project workspaces under `/Users/vincent/code-repos/whatsapp-conversation`. Each project keeps one merged conversation, one conversion per unique attachment, and a record of its dated checkpoints. The original `../target` workflow remains available through `./run.sh run`.
+This tool digests WhatsApp exports, archives (ZIP, TAR), folders, and media files into separate project workspaces under `/Users/vincent/code-repos/whatsapp-conversation`. Each project keeps one merged conversation, one conversion per unique attachment or loose file, and a record of its dated checkpoints. The original `../target` workflow remains available through `./run.sh run`.
 
 ## Quick start
 
@@ -8,7 +8,7 @@ This tool digests WhatsApp ZIP exports into separate project workspaces under `/
 cd /Users/vincent/code-repos/my-tools/whatsapp-llm-digester
 ./setup.sh
 ./run.sh new kurasi-arsip-2026
-# Copy WhatsApp export ZIPs into the project's input/ folder.
+# Copy WhatsApp export ZIPs, unzipped folders, or media files into the project's input/ folder.
 ./run.sh convert kurasi-arsip-2026
 ```
 
@@ -26,7 +26,7 @@ whatsapp-conversation/
     ├── README.md            generated evidence guide; personal notes outside its markers survive
     ├── AGENTS.md            local instructions for an LLM; existing instructions are preserved
     ├── CONTEXT.md           your background, roles, and questions; never overwritten
-    ├── input/               drop exports here, with a different filename for each checkpoint
+    ├── input/               drop exports, archives, or media files here
     ├── scratch/            optional working notes; existing folders are preserved
     ├── target/
     │   ├── todo/
@@ -40,13 +40,13 @@ whatsapp-conversation/
     └── .digester/                 import state and per-project lock; keep this directory
 ```
 
-Add newer ZIPs to `input/` and run `./run.sh convert NAME` again. Archives stay intact; extracted media is stored once across overlapping exports. ZIP filenames and upload dates do not decide chronology: coverage comes from message timestamps. Older or shorter checkpoints add missing history without deleting earlier messages. Identical ZIP contents under another filename are recorded as the same checkpoint.
+Add newer exports, archives, or media to `input/` and run `./run.sh convert NAME` again. Originals stay intact; extracted media is stored once across overlapping exports. Input filenames and upload dates do not decide chronology: coverage comes from message timestamps. Older or shorter checkpoints add missing history without deleting earlier messages. Identical contents under another filename are recorded as the same checkpoint.
 
-`input/` is the only user input area for a project: put ZIP exports there. `target/todo/` is generated working data, not a second inbox. Existing `zips/` folders migrate automatically to `input/`, preserving checkpoint records and conversion caches. If both folders already contain files, the legacy folder is retained under `input/imported-from-zips/` to avoid filename collisions. The migration can resume after interruption. To restore the old layout before using an older tool version, rename `input/` to `zips/` and change checkpoint archive paths in `.digester/state.json` back to that prefix; retained originals and conversion outputs need no reconstruction.
+`input/` is the only user input area for a project: put exports, archives, or loose media/documents there. `target/todo/` is generated working data, not a second inbox. Existing `zips/` folders migrate automatically to `input/`, preserving checkpoint records and conversion caches. If both folders already contain files, the legacy folder is retained under `input/imported-from-zips/` to avoid filename collisions. The migration can resume after interruption. To restore the old layout before using an older tool version, rename `input/` to `zips/` and change checkpoint archive paths in `.digester/state.json` back to that prefix; retained originals and conversion outputs need no reconstruction.
 
 Messages match by conversation label, timestamp, sender, body, and occurrence count. Repeated identical messages within an export are retained at the maximum count seen across checkpoints. Changed text remains a separate record; this is an evidence union, so edits and deletions cannot be reconstructed reliably from exports. Conversation labels come from the chat text filename. Keep filenames consistent across checkpoints of the same chat; use separate projects for unrelated exports both named `_chat.txt`.
 
-Media matches by full SHA-256, so renamed copies reuse the same output and changed bytes get separate records. Unchanged conversions are skipped, failed or missing outputs are retried, and cached reruns do not start the OCR server. Deleted extracted media can be restored from its original ZIP on the next conversion. Conversion-option changes invalidate the existing conversion cache. Model downloads and runtimes are shared across projects.
+Media matches by full SHA-256, so renamed copies reuse the same output and changed bytes get separate records. Unchanged conversions are skipped, failed or missing outputs are retried, and cached reruns do not start the OCR server. Deleted extracted media can be restored from retained originals on the next conversion. Conversion-option changes invalidate the existing conversion cache. Model downloads and runtimes are shared across projects.
 
 Dates default to day-first (`DD/MM/YY`), matching Indonesian exports. For a month-first export, use `./run.sh convert NAME --date-order month-first` on the first import; subsequent conversions remember it. The importer refuses to silently change a project's established date order. Timestamps retain the export's local clock; the ZIP does not establish a timezone. Android and iOS text exports, multiline messages, and system notices are supported. Unrecognized, encrypted, or corrupt archives are reported in `target/checkpoints.md` without committing a partial checkpoint.
 
