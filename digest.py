@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert ../target/todo into per-source Markdown and one combined corpus."""
+"""Convert the configured target/todo into per-source Markdown and one combined corpus."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ OCR_PYTHON = (
     / ".venv"
     / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 )
-TARGET_DIR = PROJECT_DIR.parent / "target"
+TARGET_DIR = PROJECT_DIR.parents[1] / "library/imports/legacy-digester-target"
 TODO_DIR = TARGET_DIR / "todo"
 OUTPUT_DIR = TARGET_DIR / "markdown"
 COMBINED_PATH = TARGET_DIR / "combined.md"
@@ -121,7 +121,7 @@ LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Digest ../target/todo into Markdown for LLMs. Sources are never deleted or moved.",
+        description="Digest the configured target/todo into Markdown for LLMs. Sources are never deleted or moved.",
         epilog="Projects: ./run.sh new NAME; ./run.sh convert NAME [options]; ./run.sh projects. Legacy: ./run.sh run.",
     )
     parser.add_argument(

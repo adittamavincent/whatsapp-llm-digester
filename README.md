@@ -1,18 +1,34 @@
 # whatsapp-llm-digester
 
-This tool digests WhatsApp exports, archives (ZIP, TAR), folders, and media files into separate project workspaces under `/Users/vincent/code-repos/whatsapp-conversation`. Each project keeps one merged conversation, one conversion per unique attachment or loose file, and a record of its dated checkpoints. The original `../target` workflow remains available through `./run.sh run`.
+## Shared archive, iPhone backups, and extraction queue
+
+The new archive workflow uses `./run.sh iphone inspect` / `iphone export` for Finder backup snapshots and `./run.sh enrich` for a persistent SQLite extraction queue. wacrawl remains a read-only input; extraction results, errors, attempts, and message-to-attachment references live in a separate `enrichment.sqlite`. The existing per-project commands below continue to work.
+
+```sh
+./run.sh iphone inspect
+./run.sh enrich sync
+./run.sh enrich status
+./run.sh enrich queue
+./run.sh enrich run --limit 5
+```
+
+All archive data defaults to `<code-repos>/library/whatsapp`, derived from this checkout. Before Unison, run `./run.sh library snapshot` to publish consistent SQLite backups; the active database files are excluded from file synchronization.
+
+See [the archive pipeline guide](docs/archive-pipeline.md) for backup preparation, encrypted exports, iPhone media imports, recovery, and exact data locations. `enrich sync` indexes media already present in wacrawl; it cannot download missing attachments or make Desktop history complete.
+
+This tool digests WhatsApp exports, archives (ZIP, TAR), folders, and media files into separate project workspaces under `/Users/vincent/code-repos/projects/<project-slug>`. Each project keeps one merged conversation, one conversion per unique attachment or loose file, and a record of its dated checkpoints. The original `../../library/imports/legacy-digester-target` workflow remains available through `./run.sh run`.
 
 ## Quick start
 
 ```bash
-cd /Users/vincent/code-repos/my-tools/whatsapp-llm-digester
+cd /Users/vincent/code-repos/projects/whatsapp-llm-digester
 ./setup.sh
 ./run.sh new kurasi-arsip-2026
 # Copy WhatsApp export ZIPs, unzipped folders, or media files into the project's input/ folder.
 ./run.sh convert kurasi-arsip-2026
 ```
 
-Run commands from `/Users/vincent/code-repos/my-tools/whatsapp-llm-digester`. The `whatsapp-conversation` root contains only project directories; scripts and shared documentation stay in this tool repository.
+Run commands from `/Users/vincent/code-repos/projects/whatsapp-llm-digester`. `catalog/digester-projects.json` resolves isolated workspaces; new projects default to `projects/<project-slug>`. Scripts and shared documentation stay in this tool repository.
 
 `./run.sh` or `./run.sh projects` lists existing projects and the next commands. `new` can adopt an existing project without removing its folders. Fill in the generated `CONTEXT.md` with the purpose, background (latar belakang), roles, and current goals, or supply initial text with `./run.sh new NAME --context 'Project background...'`. The generated README sends an LLM to that context and to the converted evidence. It updates facts from the exports without inventing background or roles.
 
@@ -21,7 +37,7 @@ The first transcription run downloads a local Whisper model. Later runs reuse th
 ## Project layout and checkpoints
 
 ```text
-whatsapp-conversation/
+projects/
 └── kurasi-arsip-2026/
     ├── README.md            generated evidence guide; personal notes outside its markers survive
     ├── AGENTS.md            local instructions for an LLM; existing instructions are preserved
@@ -77,7 +93,7 @@ When PDF, image, or video inputs are present, `run.sh` starts the local Metal se
 
 The parser keeps layout analysis in PaddleOCR and sends recognition crops to the loopback MLX service. Remote OCR endpoints are refused. Both the native CPU path and MLX acceleration passed local synthetic scan checks on this Mac; your document quality and processing time can differ.
 
-For the legacy loose-file workflow, copy material into `../target/todo` and run `./run.sh run`. Originals stay in `todo`; the manifest at `../target/.manifest.json` tracks what has already been processed. Project exports belong in their own `input/` folder and use `convert NAME`.
+For the legacy loose-file workflow, copy material into `../../library/imports/legacy-digester-target/todo` and run `./run.sh run`. Originals stay in `todo`; the manifest at `../../library/imports/legacy-digester-target/.manifest.json` tracks what has already been processed. Project exports belong in their own `input/` folder and use `convert NAME`.
 
 ## What it extracts
 
@@ -181,7 +197,7 @@ this folder/
     └── .cache/            package and local Whisper-model downloads
 ```
 
-`run` resolves `../target` from the tool's location. `new` and `convert` use the project root shown above. Neither depends on the terminal's current directory. You can call `run.sh` from anywhere. Flags supplied without a command, such as `./run.sh --force`, continue to target the legacy folder; use `convert NAME --force` for a project.
+`run` resolves `../../library/imports/legacy-digester-target` from the tool's location. `new` and `convert` use the project root shown above. Neither depends on the terminal's current directory. You can call `run.sh` from anywhere. Flags supplied without a command, such as `./run.sh --force`, continue to target the legacy folder; use `convert NAME --force` for a project.
 
 ## Privacy & Security Architecture
 

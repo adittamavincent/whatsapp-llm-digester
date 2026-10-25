@@ -10,6 +10,7 @@ import fcntl
 import hashlib
 import io
 import json
+import json
 import re
 import stat
 import tarfile
@@ -26,7 +27,24 @@ from project_docs import (
     write_if_changed,
 )
 
-ROOT = digest.PROJECT_DIR.parents[1] / "whatsapp-conversation"
+WORKSPACE = digest.PROJECT_DIR.parents[1]
+ROOT = WORKSPACE / "projects"
+REGISTRY = WORKSPACE / "catalog/digester-projects.json"
+
+
+def registered_projects():
+    if not REGISTRY.is_file():
+        return {}
+    data = json.loads(REGISTRY.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("Invalid digester project registry")
+    output = {}
+    for name, relative in data.items():
+        path = (WORKSPACE / relative).resolve()
+        if not path.is_relative_to(WORKSPACE.resolve()) or path == WORKSPACE.resolve():
+            raise ValueError("Registered digester path leaves code-repos")
+        output[name] = path
+    return output
 SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 
 
@@ -35,7 +53,7 @@ def project_path(name: str) -> Path:
         raise ValueError(
             "Project names must use lowercase letters, numbers, and hyphens"
         )
-    path = ROOT / name
+    path = registered_projects().get(name, ROOT / name)
     if path.is_symlink():
         raise ValueError("Project directory must not be a symlink")
     return path
@@ -681,8 +699,10 @@ def ingest(path: Path, state: dict, order: str) -> list[str]:
 
 def show_projects() -> int:
     print(f"Projects: {ROOT}")
-    for path in sorted(ROOT.iterdir()) if ROOT.exists() else []:
-        if path.is_dir() and not path.is_symlink() and SLUG.fullmatch(path.name):
+    candidates = set(registered_projects().values())
+    candidates.update(ROOT.iterdir() if ROOT.exists() else [])
+    for path in sorted(candidates):
+        if path.is_dir() and not path.is_symlink() and SLUG.fullmatch(path.name) and (path / ".digester").is_dir():
             inputs = count_inputs(path / "input")
             print(f"  {path.name}: {inputs} input(s)")
     print(

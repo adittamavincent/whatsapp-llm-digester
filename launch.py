@@ -172,6 +172,25 @@ def run_legacy(arguments: list[str]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] in {"enrich", "iphone", "library"}:
+        import sqlite3
+
+        import enrichment
+        import iphone_backup
+        import library_store
+
+        try:
+            module = {
+                "enrich": enrichment,
+                "iphone": iphone_backup,
+                "library": library_store,
+            }[arguments[0]]
+            return module.main(arguments[1:])
+        except KeyboardInterrupt:
+            return 130
+        except (RuntimeError, TypeError, ValueError, OSError, sqlite3.Error) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
     if not arguments or arguments[0] in {"new", "convert", "projects"}:
         import projects
 

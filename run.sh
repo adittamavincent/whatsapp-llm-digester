@@ -2,7 +2,7 @@
 set -eu
 
 PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-TARGET_DIR="$PROJECT_DIR/../target"
+TARGET_DIR="$PROJECT_DIR/../../library/imports/legacy-digester-target"
 
 mkdir -p "$TARGET_DIR/todo" "$TARGET_DIR/markdown" "$TARGET_DIR/.cache"
 
